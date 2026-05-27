@@ -95,14 +95,27 @@ class RemediationManager:
         remediation_logs: Optional[str] = None
         remediation_timestamp: Optional[datetime] = None
 
-        if severity in (SeverityLevel.LOW, SeverityLevel.MEDIUM):
-            # ── Tier 1: Logged for Review ─────────────────────────────────────
+        grace_period_expires_at: Optional[datetime] = None
+
+        if severity == SeverityLevel.LOW:
+            # ── Tier 1a: Grace Period ─────────────────────────────────────────
+            action_taken = RemediationAction.GRACE_PERIOD
+            from datetime import timedelta
+            grace_period_expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+            remediation_logs = (
+                f"[SYSTEM NOTIFICATION] Device has entered a 2-minute grace period.\n"
+                f"Suggested manual remediation: {remediation_command}"
+            )
+            logger.info(f"Tier 1a Remediation applied to {device_id}: Grace Period active.")
+
+        elif severity == SeverityLevel.MEDIUM:
+            # ── Tier 1b: Logged for Review ────────────────────────────────────
             action_taken = RemediationAction.LOGGED_FOR_REVIEW
             remediation_logs = (
                 f"Manual operator review recommended.\n"
                 f"Suggested manual remediation: {remediation_command}"
             )
-            logger.info(f"Tier 1 Remediation applied to {device_id}: Logged for Review.")
+            logger.info(f"Tier 1b Remediation applied to {device_id}: Logged for Review.")
 
         elif severity == SeverityLevel.HIGH:
             # ── Tier 2: Automated Self-Healing (MDM Simulation) ───────────────
@@ -168,4 +181,5 @@ class RemediationManager:
             remediation_command=remediation_command,
             remediation_logs=remediation_logs,
             remediation_timestamp=remediation_timestamp,
+            grace_period_expires_at=grace_period_expires_at,
         )

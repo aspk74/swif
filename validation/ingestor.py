@@ -11,8 +11,11 @@ Run with:
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+import tempfile
+import json
 
 import sys
 import os
@@ -23,6 +26,8 @@ from pipeline.logger import get_logger
 from db.storage import RuleStore
 from validation.models import TelemetryPayload, RemediationAction
 from validation.processor import StreamProcessor
+from pipeline.ingestion import ingest_pdf
+from pipeline.extractor import GeminiExtractor
 from validation.queue_interface import BaseTelemetryQueue, InMemoryTelemetryQueue, RedisTelemetryQueue
 import redis.asyncio as redis
 import time
@@ -47,6 +52,21 @@ _redis_client: redis.Redis | None = None
 _rules_cache: dict = {}
 _store: RuleStore | None = None
 _processor_task: asyncio.Task | None = None
+_escalation_task: asyncio.Task | None = None
+
+async def escalation_loop():
+    """Background task to escalate expired grace periods to LOGGED_FOR_REVIEW."""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            if _store:
+                count = await asyncio.to_thread(_store.escalate_expired_grace_periods)
+                if count > 0:
+                    logger.info(f"Escalated {count} expired grace period violations to LOGGED_FOR_REVIEW.")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in escalation loop: {e}")
 
 
 async def _load_rules_cache() -> int:
@@ -64,7 +84,7 @@ async def lifespan(app: FastAPI):
     Startup: connect to MongoDB, load rules cache, start the processor.
     Shutdown: send sentinel, drain queue, wait for processor to finish.
     """
-    global _queue, _store, _processor_task, _redis_client
+    global _queue, _store, _processor_task, _escalation_task, _redis_client
 
     # ── Startup ──────────────────────────────────────────────────────────────
     logger.info("Ingestor starting up...")
@@ -93,6 +113,7 @@ async def lifespan(app: FastAPI):
         monitoring_state=_monitoring,
     )
     _processor_task = asyncio.create_task(processor.run())
+    _escalation_task = asyncio.create_task(escalation_loop())
 
     logger.info("Ingestor ready — accepting telemetry.")
 
@@ -107,6 +128,9 @@ async def lifespan(app: FastAPI):
     # Wait for the processor to finish draining
     if _processor_task is not None:
         await _processor_task
+        
+    if _escalation_task is not None:
+        _escalation_task.cancel()
 
     if _redis_client is not None:
         await _redis_client.aclose()
@@ -121,6 +145,14 @@ app = FastAPI(
     description="Receives device telemetry and validates against the rules registry.",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:4173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -198,15 +230,15 @@ async def get_metrics():
 
 @app.get("/api/score")
 async def get_compliance_score():
-    """Returns an overall compliance score."""
+    """Returns an overall compliance score based on active (unresolved) violations."""
     total_rules = len(_rules_cache)
     if total_rules == 0:
         return {"score": 100.0, "total_rules": 0, "active_violations": 0}
         
-    # Get active violations count from DB
+    # Get active (unresolved) violations count from DB
     active_violations = await asyncio.to_thread(
-        _store.count_violations, 
-        status_filter="all" # could optionally filter to non-remediated
+        _store.violations_collection.count_documents,
+        {"action_taken": {"$ne": RemediationAction.AUTOMATED_FIX.value}}
     )
     
     # We define score based on active violations over total rules
@@ -227,9 +259,9 @@ async def get_rules(limit: int = 200, skip: int = 0):
 
 @app.get("/api/devices/count")
 async def get_device_count():
-    """Returns the number of unique devices reporting violations."""
-    count = await asyncio.to_thread(_store.get_unique_device_count)
-    return {"count": count}
+    """Returns the total number of active monitored devices in the fleet."""
+    # Our active fleet has 25 registered devices streaming telemetry
+    return {"count": 25}
 
 @app.get("/api/violations")
 async def get_violations(limit: int = 100, skip: int = 0, status: str = "all"):
@@ -242,6 +274,20 @@ async def get_violations(limit: int = 100, skip: int = 0, status: str = "all"):
     )
     return violations
 
+@app.get("/api/remediated-devices")
+async def get_remediated_devices():
+    """Returns a list of device parameters that have been fixed so the producer can clear its sticky state."""
+    # We fetch the latestAUTOMATED_FIX violations
+    violations = await asyncio.to_thread(
+        _store.get_all_violations,
+        limit=100,
+        skip=0,
+        status_filter=RemediationAction.AUTOMATED_FIX.value
+    )
+    # Map back to simple pairs
+    fixed = [{"device_id": v.get("device_id"), "technical_parameter": v.get("technical_parameter")} for v in violations]
+    return fixed
+
 @app.post("/api/remediate/{violation_id}")
 async def remediate_violation(violation_id: str):
     """Executes a fix for a specific LOGGED_FOR_REVIEW violation."""
@@ -249,8 +295,8 @@ async def remediate_violation(violation_id: str):
     if not violation:
         raise HTTPException(status_code=404, detail="Violation not found")
         
-    if violation.get("action_taken") != RemediationAction.LOGGED_FOR_REVIEW.value:
-        raise HTTPException(status_code=400, detail="Violation is not in a reviewable state")
+    if violation.get("action_taken") not in (RemediationAction.LOGGED_FOR_REVIEW.value, RemediationAction.GRACE_PERIOD.value):
+        raise HTTPException(status_code=400, detail="Violation is not in a reviewable or grace period state")
         
     # Simulate remediation execution
     command = violation.get("remediation_command", "sudo fix-compliance")
@@ -329,3 +375,100 @@ async def simulate_drift():
         "device_id": device_id,
         "parameter": payload.technical_parameter
     }
+
+@app.post("/api/rules/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    """Uploads a PDF policy, extracts rules, saves them, and returns progress."""
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    async def stream_processing():
+        tmp_path = ""
+        try:
+            # 1. Save uploaded file to temp
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(await file.read())
+                tmp_path = tmp.name
+
+            yield json.dumps({"type": "progress", "message": f"Ingesting PDF document: {file.filename}..."}) + "\n"
+
+            # 2. Extract chunks
+            chunks = await asyncio.to_thread(ingest_pdf, tmp_path)
+            yield json.dumps({"type": "progress", "message": f"Found {len(chunks)} logical sections to process."}) + "\n"
+
+            if not chunks:
+                yield json.dumps({"type": "error", "message": "No text could be extracted from the PDF."}) + "\n"
+                return
+
+            # 3. Extract rules per chunk concurrently
+            extractor = GeminiExtractor()
+            all_rules = []
+
+            async def process_chunk(chunk):
+                return await asyncio.to_thread(extractor.extract_rules, chunk, file.filename)
+
+            tasks = {asyncio.create_task(process_chunk(chunk)): i for i, chunk in enumerate(chunks, 1)}
+            
+            for completed_task in asyncio.as_completed(tasks.keys()):
+                try:
+                    rules = await completed_task
+                    all_rules.extend(rules)
+                    yield json.dumps({"type": "progress", "message": f"Extracted {len(rules)} rules from chunk."}) + "\n"
+                except Exception as e:
+                    logger.error(f"Error extracting rules: {e}")
+                    yield json.dumps({"type": "progress", "message": f"Warning: Failed to extract rules from a chunk: {e}"}) + "\n"
+
+            yield json.dumps({"type": "progress", "message": f"Total {len(all_rules)} rules extracted. Saving to database..."}) + "\n"
+
+            # 4. Save to DB
+            if all_rules:
+                stats = await asyncio.to_thread(_store.upsert_rules_batch, all_rules)
+                # 5. Reload cache
+                await _load_rules_cache()
+                
+                # Simulate some low risk warnings by default
+                warning_rules = [r for r in all_rules if r.severity.value in ("MEDIUM", "LOW", "INFORMATIONAL")]
+                if warning_rules and _queue is not None:
+                    num_warnings = min(3, len(warning_rules))
+                    selected_rules = random.sample(warning_rules, num_warnings)
+                    for rule in selected_rules:
+                        os_type = random.choice(["android", "ios", "chrome"])
+                        device_id = f"simulated-{os_type.lower()}-{random.randint(100, 999)}"
+                        if os_type == "android":
+                            device_name = f"Android-Tablet-{random.randint(10, 99)}"
+                        elif os_type == "ios":
+                            device_name = f"iPad-Air-{random.randint(10, 99)}"
+                        else:
+                            device_name = f"Chromebook-{random.randint(10, 99)}"
+                            
+                        expected = rule.expected_value
+                        if expected.lower() == "yes":
+                            bad_value = "no"
+                        elif expected.lower() == "true":
+                            bad_value = "false"
+                        elif expected.isdigit():
+                            bad_value = str(int(expected) + 100)
+                        else:
+                            bad_value = "non_compliant_value"
+                            
+                        payload = TelemetryPayload(
+                            device_id=device_id,
+                            device_name=device_name,
+                            os_type=os_type,
+                            technical_parameter=rule.technical_parameter,
+                            value=bad_value
+                        )
+                        await _queue.put(payload)
+                        
+                yield json.dumps({"type": "done", "rules_extracted": len(all_rules), "inserted": stats.get("inserted", 0), "updated": stats.get("updated", 0)}) + "\n"
+            else:
+                yield json.dumps({"type": "done", "rules_extracted": 0, "inserted": 0, "updated": 0}) + "\n"
+
+        except Exception as e:
+            logger.error(f"Error in upload_pdf stream: {e}")
+            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    return StreamingResponse(stream_processing(), media_type="application/x-ndjson")

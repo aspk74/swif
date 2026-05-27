@@ -233,6 +233,36 @@ class RuleStore:
         except InvalidId:
             return None
 
+    def get_active_violation(self, device_id: str, technical_parameter: str) -> dict | None:
+        """Fetch the current active (unresolved) violation for a given device and parameter."""
+        # Active means it's NOT an AUTOMATED_FIX (i.e. it's still an open issue)
+        v = self.violations_collection.find_one({
+            "device_id": device_id,
+            "technical_parameter": technical_parameter,
+            "action_taken": {"$ne": "AUTOMATED_FIX"}
+        })
+        if v:
+            v["_id"] = str(v["_id"])
+        return v
+
+    def escalate_expired_grace_periods(self) -> int:
+        """Bulk updates all expired GRACE_PERIOD violations to LOGGED_FOR_REVIEW and upgrades severity to HIGH."""
+        from datetime import datetime, timezone
+        result = self.violations_collection.update_many(
+            {
+                "action_taken": "GRACE_PERIOD",
+                "grace_period_expires_at": {"$lt": datetime.now(timezone.utc).isoformat()}
+            },
+            {
+                "$set": {
+                    "action_taken": "LOGGED_FOR_REVIEW",
+                    "severity": "HIGH",
+                    "remediation_logs": "[SYSTEM AUTOMATION] Grace period expired. Escalated to HIGH risk error and LOGGED_FOR_REVIEW."
+                }
+            }
+        )
+        return result.modified_count
+
     def update_violation(self, violation_id: str, update_data: dict) -> bool:
         """Update a violation document. Returns True if modified."""
         from bson import ObjectId

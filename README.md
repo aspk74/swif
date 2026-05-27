@@ -144,6 +144,22 @@ python -m validation.producer
 
 The producer will simulate 5 devices sending telemetry every 1–2 seconds. Roughly half will be non-compliant, generating violations.
 
+### Running the Frontend Dashboard
+
+The frontend is a premium, cinematic dark-mode developer dashboard built with React, Vite, Tailwind CSS, and Framer Motion. It provides real-time rule visualization, drag-and-drop PDF rule upload, and telemetry violation monitoring.
+
+To start the frontend developer server:
+
+**Terminal 3 — Start the Frontend**
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Once started, open [http://localhost:5173](http://localhost:5173) in your browser. The Vite dev server automatically proxies frontend API calls to your FastAPI backend at `http://127.0.0.1:8000`.
+
+
 ### Verifying Results
 
 **Check the ingestor health:**

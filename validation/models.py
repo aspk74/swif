@@ -16,6 +16,7 @@ class RemediationAction(str, Enum):
     LOGGED_FOR_REVIEW = "LOGGED_FOR_REVIEW"
     AUTOMATED_FIX = "AUTOMATED_FIX"
     QUARANTINED = "QUARANTINED"
+    GRACE_PERIOD = "GRACE_PERIOD"
 
 
 class TelemetryPayload(BaseModel):
@@ -81,6 +82,10 @@ class ComplianceViolation(BaseModel):
     )
     violated_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
+    )
+    grace_period_expires_at: Optional[datetime] = Field(
+        default=None,
+        description="When the grace period expires and the violation escalates"
     )
 
     @field_validator("os_type", mode="before")

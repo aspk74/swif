@@ -100,9 +100,40 @@ class StreamProcessor:
                 f"COMPLIANT: device={payload.device_id}, "
                 f"param={payload.technical_parameter}, value={payload.value}"
             )
+            # Resolve any existing active violation since the device is now compliant
+            active_violation = await asyncio.to_thread(
+                self.store.get_active_violation,
+                payload.device_id,
+                payload.technical_parameter
+            )
+            if active_violation:
+                from datetime import datetime, timezone
+                await asyncio.to_thread(
+                    self.store.update_violation,
+                    active_violation["_id"],
+                    {
+                        "action_taken": RemediationAction.AUTOMATED_FIX.value,
+                        "remediation_logs": "[SYSTEM AUTOMATION] Device reported compliant state. Violation resolved.",
+                        "remediation_timestamp": datetime.now(timezone.utc)
+                    }
+                )
+                logger.info(f"Resolved violation for device={payload.device_id}, param={payload.technical_parameter}")
             return
 
         # --- Violation detected ---
+        # First, check if there is already an active (unresolved) violation for this
+        # device and parameter to prevent spamming the database every 10 seconds.
+        active_violation = await asyncio.to_thread(
+            self.store.get_active_violation,
+            payload.device_id,
+            payload.technical_parameter
+        )
+
+        if active_violation:
+            # We already know about this violation. Just update the timestamp if needed.
+            # (To save DB writes we can just ignore it, or optionally update violated_at).
+            return
+
         self._violations += 1
         if self._monitoring_state:
             self._monitoring_state.total_violations_detected += 1
@@ -117,7 +148,7 @@ class StreamProcessor:
         )
 
         logger.warning(
-            f"VIOLATION: device={payload.device_id}, "
+            f"NEW VIOLATION: device={payload.device_id}, "
             f"param={payload.technical_parameter}, "
             f"expected={rule['expected_value']} ({logic.value}), "
             f"actual={payload.value}, "
